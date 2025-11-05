@@ -24,7 +24,7 @@ except Exception:
         f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
         return prec, rec, f1
 
-MAX_ITERS = 3
+MAX_ITERS = 2
 DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "mini_slicebench_final.jsonl")
 RESULT_PATH = os.path.join(os.path.dirname(__file__), "..", "results", "slm_slice.jsonl")
 
@@ -155,4 +155,8 @@ def control_loop(limit: int = 50):
     return results
 
 if __name__ == "__main__":
-    control_loop(limit=50)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=50, help="number of examples to process")
+    args = parser.parse_args()
+    control_loop(limit=args.limit)

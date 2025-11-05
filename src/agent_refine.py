@@ -7,6 +7,8 @@ hf_logging.set_verbosity_error()
 def refine(code: str, candidate: str, feedback: str, max_new_tokens: int = 512) -> str:
     """
     Produce a corrected slice given code, current candidate, and verifier feedback.
+    Caps generation to 256 tokens to avoid extremely long outputs.
+    Deterministic: temperature=0.0 and do_sample=False.
     """
     if tok is None or model is None:
         raise RuntimeError("Model not loaded (persistent_loader).")
@@ -22,8 +24,8 @@ def refine(code: str, candidate: str, feedback: str, max_new_tokens: int = 512) 
     with torch.inference_mode():
         out = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=0.3,
+            max_new_tokens=min(max_new_tokens, 256),
+            temperature=0.0,
             do_sample=False,
             use_cache=True
         )

@@ -16,8 +16,8 @@ def _clean_output(text: str) -> str:
 
 def synthesize(code: str, line: int, max_new_tokens: int = 512) -> str:
     """
-    Generate candidate slice for the given code and line.
-    Uses the persistent model loaded by persistent_loader.py.
+    Generate candidate slice for the given code and line using the persistent model.
+    Deterministic: temperature=0.0 and do_sample=False.
     """
     if tok is None or model is None:
         raise RuntimeError("Model not loaded (persistent_loader).")
@@ -31,7 +31,7 @@ def synthesize(code: str, line: int, max_new_tokens: int = 512) -> str:
         out = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=0.2,
+            temperature=0.0,
             do_sample=False,
             use_cache=True
         )
