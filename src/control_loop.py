@@ -4,6 +4,7 @@ import os
 import time
 import gc
 import traceback
+import argparse
 import torch
 
 from agent_synthesis import synthesize
@@ -35,11 +36,7 @@ def clean_gpu():
         pass
     gc.collect()
 
-def control_loop(limit: int = 50):
-    print("🔹 Starting multi-agent slice synthesis pipeline…")
-    print("ℹ️ Model mode: persistent (single persistent model load)")
-
-    # load examples
+def _load_examples():
     examples = []
     if not os.path.exists(DATA_PATH):
         raise FileNotFoundError(f"Data file not found: {DATA_PATH}")
@@ -52,24 +49,66 @@ def control_loop(limit: int = 50):
                 examples.append(json.loads(line))
             except Exception:
                 continue
+    return examples
 
+def _load_processed_ids(result_path):
+    processed_ids = set()
+    if not os.path.exists(result_path):
+        return processed_ids
+    try:
+        with open(result_path, "r", encoding="utf-8") as rf:
+            for ln in rf:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                    # support both "id" and nested formats
+                    if isinstance(r, dict) and "id" in r:
+                        processed_ids.add(r["id"])
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return processed_ids
+
+def control_loop(limit: int = 50, resume: bool = True):
+    print("🔹 Starting multi-agent slice synthesis pipeline…")
+    print("ℹ️ Model mode: persistent (single persistent model load)")
+
+    # load all examples
+    examples = _load_examples()
+    total_examples = len(examples)
+    print(f"📘 Loaded {total_examples} examples from dataset")
+
+    # ensure results dir exists
     os.makedirs(os.path.dirname(RESULT_PATH), exist_ok=True)
+
+    # load processed ids if resuming
+    processed_ids = _load_processed_ids(RESULT_PATH) if resume else set()
+    if processed_ids:
+        print(f"🔁 Found {len(processed_ids)} already-processed examples in results; will skip them")
+
+    # build list of examples to run (preserve order)
+    remaining = [ex for ex in examples if ex.get("id", None) not in processed_ids]
+    if limit is not None:
+        remaining = remaining[:limit]
+    print(f"▶️ Will process {len(remaining)} examples (limit set to {limit})")
 
     results = []
     ok_count = 0
     f1_sum = 0.0
     processed = 0
-    total = min(len(examples), limit)
 
     start_all = time.time()
-    for idx, ex in enumerate(examples[:limit]):
+    for idx, ex in enumerate(remaining):
         example_start = time.time()
         try:
             code = ex.get("code", "")
             line = ex.get("line", 0)
             gold = ex.get("gold", ex.get("slice", [])) or []
             ex_id = ex.get("id", idx)
-            print(f"\n=== Example {idx+1}/{total} id={ex_id} line={line} ===")
+            print(f"\n=== Example {idx+1}/{len(remaining)} id={ex_id} line={line} ===")
 
             # Synthesis
             t0 = time.time()
@@ -129,34 +168,53 @@ def control_loop(limit: int = 50):
                     "example_total": example_time
                 }
             }
+
+            # append to results file (safe append) only if not already present
+            try:
+                already = False
+                if ex_id in processed_ids:
+                    already = True
+                if not already:
+                    with open(RESULT_PATH, "a", encoding="utf-8") as fout:
+                        fout.write(json.dumps(rec) + "\n")
+                    processed_ids.add(ex_id)
+                else:
+                    print(f"🔁 Skipping write for id={ex_id} (already present)")
+            except Exception as e:
+                print("⚠️ Failed to write result for id=", ex_id, "err=", e)
+
             results.append(rec)
 
-            with open(RESULT_PATH, "a", encoding="utf-8") as fout:
-                fout.write(json.dumps(rec) + "\n")
-
+            # light cleanup between examples
             clean_gpu()
             time.sleep(0.1)
 
         except Exception as e:
             print("❌ Error processing example", idx, "id=", ex.get("id", idx))
             traceback.print_exc()
+            # still append a minimal failure record if not already present
             fail_rec = {"id": ex.get("id", idx), "error": str(e)}
-            with open(RESULT_PATH, "a", encoding="utf-8") as fout:
-                fout.write(json.dumps(fail_rec) + "\n")
+            try:
+                if ex.get("id", idx) not in processed_ids:
+                    with open(RESULT_PATH, "a", encoding="utf-8") as fout:
+                        fout.write(json.dumps(fail_rec) + "\n")
+                    processed_ids.add(ex.get("id", idx))
+            except Exception:
+                pass
             clean_gpu()
             continue
 
     total_time = time.time() - start_all
     avg_f1 = (f1_sum / processed) if processed else 0.0
-    print(f"\n🏁 Done. Processed {processed}/{total} examples.")
+    print(f"\n🏁 Done. Processed {processed}/{len(remaining)} examples in this run.")
     print(f"Verified OK: {ok_count}/{processed} ({(ok_count/processed*100) if processed else 0:.2f}%)")
     print(f"Average F1 over processed examples: {avg_f1:.4f}")
     print(f"Total pipeline time: {total_time:.1f}s (avg {total_time/processed:.2f}s per example)" if processed else f"Total pipeline time: {total_time:.1f}s")
     return results
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=50, help="number of examples to process")
+    parser.add_argument("--limit", type=int, default=50, help="number of examples to process (default 50)")
+    parser.add_argument("--no-resume", dest="resume", action="store_false", help="do not skip already-processed examples in results file")
     args = parser.parse_args()
-    control_loop(limit=args.limit)
+    control_loop(limit=args.limit, resume=args.resume)
