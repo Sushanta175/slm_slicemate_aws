@@ -1,55 +1,66 @@
 # src/agent_refine.py
-import os
-import torch
 import gc
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import torch
+from model_manager import try_load_persistent, get_mode, get_persistent, load_model_percall, unload_model_percall
+from transformers import logging as hf_logging
 
-MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
+hf_logging.set_verbosity_error()
 
-def _load_model():
-    print("🔹 Loading model for refinement (8-bit, BF16 preferred)...")
-    bnb = BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=False)
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL,
-            quantization_config=bnb,
-            device_map="auto",
-            torch_dtype=torch.bfloat16
-        )
-    except Exception as e:
-        print(f"⚠️ GPU load failed ({e}), falling back to CPU.")
-        tokenizer = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float16, device_map={"": "cpu"})
-    return tokenizer, model
+# try persistent at import
+try_load_persistent()
 
 def refine(code: str, candidate: str, feedback: str, max_new_tokens: int = 512) -> str:
-    tokenizer, model = _load_model()
-    try:
-        prompt = (
-            "### Task: Given the code, the current candidate slice, and verifier feedback, produce a corrected slice.\n"
-            "Output only the corrected code lines, no explanation.\n\n"
-            f"### Code:\n{code}\n\n"
-            f"### Current candidate slice:\n{candidate}\n\n"
-            f"### Verifier feedback:\n{feedback}\n\n"
-            "### Corrected slice:\n"
-        )
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
-        with torch.inference_mode():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=0.3,
-                do_sample=False,
-                use_cache=True
-            )
-        text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    finally:
+    """
+    Public API used by control_loop.py: returns the corrected slice (string).
+    Uses persistent model if available, else per-call.
+    """
+    mode = get_mode()
+    prompt = (
+        "### Task: Given the code, the current candidate slice, and verifier feedback, produce a corrected slice.\n"
+        "Output only the corrected code lines, no explanation.\n\n"
+        f"### Code:\n{code}\n\n"
+        f"### Current candidate slice:\n{candidate}\n\n"
+        f"### Verifier feedback:\n{feedback}\n\n"
+        "### Corrected slice:\n"
+    )
+    if mode == "persistent":
+        tok, model = get_persistent()
         try:
-            del inputs, outputs
-        except Exception:
-            pass
-        del model, tokenizer
-        torch.cuda.empty_cache()
-        gc.collect()
-    return text
+            inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
+            with torch.inference_mode():
+                outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.3, do_sample=False)
+            text = tok.decode(outputs[0], skip_special_tokens=True)
+            # trim repeated prompt
+            if "### Corrected slice" in text:
+                text = text.split("### Corrected slice")[-1].strip()
+            return text.strip()
+        except RuntimeError as e:
+            print("agent_refine: persistent path OOM/runtime error; falling back per-call for this refine():", e)
+            try:
+                tok2, model2 = load_model_percall()
+                inputs = tok2(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model2.device)
+                with torch.inference_mode():
+                    outputs = model2.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.3, do_sample=False)
+                text = tok2.decode(outputs[0], skip_special_tokens=True)
+                if "### Corrected slice" in text:
+                    text = text.split("### Corrected slice")[-1].strip()
+                return text.strip()
+            finally:
+                try:
+                    unload_model_percall(tok2, model2)
+                except Exception:
+                    pass
+        finally:
+            gc.collect()
+    else:
+        tok2, model2 = load_model_percall()
+        try:
+            inputs = tok2(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model2.device)
+            with torch.inference_mode():
+                outputs = model2.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.3, do_sample=False)
+            text = tok2.decode(outputs[0], skip_special_tokens=True)
+            if "### Corrected slice" in text:
+                text = text.split("### Corrected slice")[-1].strip()
+            return text.strip()
+        finally:
+            unload_model_percall(tok2, model2)

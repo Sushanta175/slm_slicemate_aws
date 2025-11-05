@@ -1,65 +1,79 @@
 # src/agent_synthesis.py
-import os
-import torch
 import gc
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import torch
+from model_manager import try_load_persistent, get_mode, get_persistent, load_model_percall, unload_model_percall
+from transformers import logging as hf_logging
 
-MODEL = "mistralai/Mistral-7B-Instruct-v0.2"  # change if you prefer a different model
+hf_logging.set_verbosity_error()  # reduce noise
 
-def _load_model():
-    """Load tokenizer+model into GPU (8-bit quantized where possible)."""
-    print("🔹 Loading model for synthesis (8-bit, BF16 preference)...")
-    bnb = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_enable_fp32_cpu_offload=False
-    )
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL,
-            quantization_config=bnb,
-            device_map="auto",
-            torch_dtype=torch.bfloat16
-        )
-    except Exception as e:
-        print(f"⚠️ GPU load failed or quantization not supported ({e}). Falling back to CPU/FP16.")
-        tokenizer = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float16, device_map={"": "cpu"})
-    return tokenizer, model
+# ensure we attempt persistent load at import time (on RunPod A40 this should succeed)
+try_load_persistent()
 
 def _truncate_code(code: str, max_chars: int = 15000) -> str:
     if len(code) <= max_chars:
         return code
     return code[-max_chars:]
 
+def _clean_output(text: str) -> str:
+    # if model echoes prompts, try to trim to slice section
+    if "### Slice" in text:
+        return text.split("### Slice")[-1].strip()
+    if "### Slice for line" in text:
+        return text.split("### Slice for line")[-1].strip()
+    return text.strip()
+
 def synthesize(code: str, line: int, max_new_tokens: int = 512) -> str:
-    """Generate a candidate slice for the given line."""
-    tokenizer, model = _load_model()
-    try:
-        code_trunc = _truncate_code(code)
-        prompt = (
-            f"### Task: Generate only the relevant static program slice (code lines only) "
-            f"for the specified line.\n\n### Code:\n{code_trunc}\n\n### Slice for line {line}:\n"
-        )
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
+    """
+    Public API used by control_loop.py. Internally uses persistent model if available,
+    otherwise loads model per call (safe on Colab).
+    """
+    mode = get_mode()
+    code_trunc = _truncate_code(code)
+    prompt = (
+        f"### Task: Generate only the relevant static program slice (code lines only) "
+        f"for the specified line.\n\n### Code:\n{code_trunc}\n\n### Slice for line {line}:\n"
+    )
 
-        with torch.inference_mode():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=0.2,
-                do_sample=False,
-                use_cache=True
-            )
-        text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    finally:
-        # unload
+    if mode == "persistent":
+        tok, model = get_persistent()
         try:
-            del inputs, outputs
-        except Exception:
-            pass
-        del model, tokenizer
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    return text
+            inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model.device)
+            with torch.inference_mode():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.2,
+                    do_sample=False,
+                    use_cache=True
+                )
+            text = tok.decode(outputs[0], skip_special_tokens=True)
+            return _clean_output(text)
+        except RuntimeError as e:
+            # fallback to per-call on OOM
+            print("agent_synthesis: persistent path OOM/runtime error, switching to per-call for this call:", e)
+            try:
+                tok2, model2 = load_model_percall()
+                inputs = tok2(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model2.device)
+                with torch.inference_mode():
+                    outputs = model2.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.2, do_sample=False)
+                text = tok2.decode(outputs[0], skip_special_tokens=True)
+                return _clean_output(text)
+            finally:
+                try:
+                    unload_model_percall(tok2, model2)
+                except Exception:
+                    pass
+        finally:
+            # allow GC but do not unload persistent model
+            gc.collect()
+    else:
+        # per-call mode
+        tok2, model2 = load_model_percall()
+        try:
+            inputs = tok2(prompt, return_tensors="pt", truncation=True, max_length=4096).to(model2.device)
+            with torch.inference_mode():
+                outputs = model2.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.2, do_sample=False)
+            text = tok2.decode(outputs[0], skip_special_tokens=True)
+            return _clean_output(text)
+        finally:
+            unload_model_percall(tok2, model2)
