@@ -1,5 +1,7 @@
-# src/control_loop.py
-import json, os, torch, gc
+\# src/control_loop.py
+import json
+import os
+import torch, gc
 from agent_synthesis import synthesize
 from agent_verify import verify
 from agent_refine import refine
@@ -9,7 +11,10 @@ DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "mini_sliceben
 RESULT_PATH = os.path.join(os.path.dirname(__file__), "..", "results", "slm_slice.jsonl")
 
 def clean_gpu():
-    torch.cuda.empty_cache()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
     gc.collect()
 
 def control_loop():
@@ -17,20 +22,25 @@ def control_loop():
     examples = []
     with open(DATA_PATH, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
             try:
                 examples.append(json.loads(line))
-            except:
+            except Exception:
                 continue
 
     os.makedirs(os.path.dirname(RESULT_PATH), exist_ok=True)
-    results, ok_count, total = [], 0, len(examples)
+    results = []
+    ok_count = 0
+    total = len(examples)
 
-    for idx, ex in enumerate(examples[:20]):
+    for idx, ex in enumerate(examples[:50]):  # limit adjustable
         code, line = ex.get("code", ""), ex.get("line", 0)
         print(f"\n=== Example {idx+1} Line {line} ===")
 
         candidate = synthesize(code, line)
-        print("\nInitial Slice:\n", candidate[:1000])
+        print("\nInitial Slice (head):\n", candidate[:1200])
         clean_gpu()
 
         feedback = ""
@@ -45,7 +55,7 @@ def control_loop():
                 break
 
             candidate = refine(code, candidate, feedback)
-            print("🔁 Refined Slice:\n", candidate[:1000])
+            print("🔁 Refined Slice (head):\n", candidate[:1200])
             clean_gpu()
 
         results.append({
@@ -55,11 +65,15 @@ def control_loop():
             "feedback": feedback,
         })
 
+        # write incremental progress
         with open(RESULT_PATH, "w", encoding="utf-8") as fout:
             for r in results:
                 fout.write(json.dumps(r) + "\n")
 
-    print(f"\n🏁 Done. Accuracy: {ok_count}/{total} = {ok_count/total:.2%}")
+    try:
+        print(f"\n🏁 Done. Accuracy: {ok_count}/{total} = {ok_count/total:.2%}")
+    except ZeroDivisionError:
+        print("\n⚠️ No valid examples processed.")
 
 if __name__ == "__main__":
     control_loop()
