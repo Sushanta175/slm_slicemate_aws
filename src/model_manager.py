@@ -1,16 +1,6 @@
-# src/model_manager.py
-import gc
-import traceback
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+# --- replace the try_load_persistent and load_model_percall definitions in src/model_manager.py ---
 
-# Change this to your preferred model / HF id
-MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
-
-# Global persistent state
-_state = {"tok": None, "model": None, "mode": "try_once"}  # modes: try_once | persistent | percall
-
-def try_load_persistent(device_map="auto", dtype=torch.bfloat16, offload_folder="offload"):
+def try_load_persistent(device_map="auto", dtype=None, offload_folder="offload"):
     """
     Try to load tokenizer+model once into GPU (or with auto device_map).
     On failure (OOM or other), cleanup and switch to percall mode.
@@ -22,12 +12,15 @@ def try_load_persistent(device_map="auto", dtype=torch.bfloat16, offload_folder=
         print("model_manager: attempting persistent load:", MODEL)
         bnb = BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=False)
         tok = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
+
+        # NOTE: Do NOT pass torch_dtype when using bitsandbytes quantization_config.
+        # The model weights are already placed on devices/dtype by bnb; passing torch_dtype
+        # can cause internal `.to(...)` calls which are unsupported for bnb quantized models.
         model = AutoModelForCausalLM.from_pretrained(
             MODEL,
             quantization_config=bnb,
             device_map=device_map,
             low_cpu_mem_usage=True,
-            torch_dtype=dtype,
             offload_folder=offload_folder,
             offload_buffers=True
         )
@@ -37,31 +30,13 @@ def try_load_persistent(device_map="auto", dtype=torch.bfloat16, offload_folder=
         return True
     except Exception as e:
         print("model_manager: persistent load FAILED, falling back to per-call. Error:")
+        # print stack for debugging
+        import traceback
         traceback.print_exc()
         cleanup_persistent()
         _state["mode"] = "percall"
         return False
 
-def cleanup_persistent():
-    try:
-        if _state.get("model") is not None:
-            try:
-                del _state["model"]
-            except Exception:
-                pass
-        if _state.get("tok") is not None:
-            try:
-                del _state["tok"]
-            except Exception:
-                pass
-    except Exception:
-        pass
-    try:
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
-    gc.collect()
-    _state["tok"], _state["model"] = None, None
 
 def load_model_percall(dtype=torch.float16, offload_folder="offload"):
     """
@@ -71,47 +46,28 @@ def load_model_percall(dtype=torch.float16, offload_folder="offload"):
     try:
         bnb = BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=False)
         tok = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
-        # Use auto device map if CUDA available, otherwise CPU-only
+
+        # For bitsandbytes quantized load, do not pass torch_dtype here either.
+        # Use device_map="auto" so accelerate places shards properly.
         device_map = "auto" if torch.cuda.is_available() else {"": "cpu"}
         model = AutoModelForCausalLM.from_pretrained(
             MODEL,
             quantization_config=bnb,
             device_map=device_map,
             low_cpu_mem_usage=True,
-            torch_dtype=dtype,
             offload_folder=offload_folder,
             offload_buffers=True
         )
         model.eval()
         return tok, model
-    except Exception:
+    except Exception as e:
         # attempt a safer CPU-only fallback
+        print("model_manager: percall load failed (quantized path). Trying CPU-only fallback. Err:", e)
         try:
-            print("model_manager: percall load failed, trying CPU-only fallback")
             tok = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
             model = AutoModelForCausalLM.from_pretrained(MODEL, device_map={"": "cpu"})
             model.eval()
             return tok, model
         except Exception:
+            print("model_manager: CPU-only fallback also failed.")
             raise
-
-def unload_model_percall(tok, model):
-    try:
-        del model
-    except Exception:
-        pass
-    try:
-        del tok
-    except Exception:
-        pass
-    try:
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
-    gc.collect()
-
-def get_mode():
-    return _state["mode"]
-
-def get_persistent():
-    return _state["tok"], _state["model"]
