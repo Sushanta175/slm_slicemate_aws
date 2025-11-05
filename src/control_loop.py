@@ -4,10 +4,8 @@ import os
 import time
 import gc
 import traceback
-
 import torch
 
-from model_manager import get_mode  # to show persistent/percall
 from agent_synthesis import synthesize
 from agent_verify import verify
 from agent_refine import refine
@@ -16,7 +14,6 @@ from agent_refine import refine
 try:
     from eval.metrics import f1_exact
 except Exception:
-    # fallback simple set-based F1 if eval.metrics isn't available
     def f1_exact(pred_lines, gold_lines):
         pred, gold = set([ln.strip() for ln in pred_lines if ln.strip()]), set([ln.strip() for ln in gold_lines if ln.strip()])
         tp = len(pred & gold)
@@ -40,8 +37,7 @@ def clean_gpu():
 
 def control_loop(limit: int = 50):
     print("🔹 Starting multi-agent slice synthesis pipeline…")
-    mode = get_mode()
-    print(f"ℹ️ Model manager mode: {mode}")
+    print("ℹ️ Model mode: persistent (single persistent model load)")
 
     # load examples
     examples = []
@@ -94,14 +90,12 @@ def control_loop(limit: int = 50):
                 print(f"[verify] iter={it+1} time={t_v:.2f}s -> {str(fb)[:300]!r}")
                 feedback_text = fb
 
-                # treat "OK" (case-insensitive) as success
                 if isinstance(fb, str) and fb.strip().upper().startswith("OK"):
                     verified_ok = True
                     ok_count += 1
                     print("✅ Verified OK")
                     break
 
-                # refinement
                 t0 = time.time()
                 candidate = refine(code, candidate, fb)
                 t_r = time.time() - t0
@@ -121,7 +115,6 @@ def control_loop(limit: int = 50):
             example_time = time.time() - example_start
             print(f"[example done] id={ex_id} synth={t_synth:.2f}s verify={t_verify_total:.2f}s refine={t_refine_total:.2f}s total={example_time:.2f}s f1={f1:.4f}")
 
-            # prepare result record
             rec = {
                 "id": ex_id,
                 "line": line,
@@ -138,18 +131,15 @@ def control_loop(limit: int = 50):
             }
             results.append(rec)
 
-            # append to results file (safe append)
             with open(RESULT_PATH, "a", encoding="utf-8") as fout:
                 fout.write(json.dumps(rec) + "\n")
 
-            # light cleanup between examples
             clean_gpu()
             time.sleep(0.1)
 
         except Exception as e:
             print("❌ Error processing example", idx, "id=", ex.get("id", idx))
             traceback.print_exc()
-            # still append a minimal failure record
             fail_rec = {"id": ex.get("id", idx), "error": str(e)}
             with open(RESULT_PATH, "a", encoding="utf-8") as fout:
                 fout.write(json.dumps(fail_rec) + "\n")
